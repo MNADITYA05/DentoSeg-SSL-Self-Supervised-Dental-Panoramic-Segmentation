@@ -1,4 +1,4 @@
 # DentoSeg-SSL-Self-Supervised-Dental-Panoramic-Segmentation
 
 
-![Logo](RESULTS.png)
+![Logo](RESULTS.jpeg)
