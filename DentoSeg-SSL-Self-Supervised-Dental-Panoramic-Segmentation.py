@@ -7,6 +7,9 @@ from tensorflow.keras import layers, models
 import pathlib
 import natsort
 from sklearn.model_selection import train_test_split
+import tensorflow as tf
+import numpy as np
+import cv2
 from tqdm import tqdm, trange  # for progress bars
 
 # Configuration
@@ -17,8 +20,8 @@ LEARNING_RATE_FINETUNE = 1e-4
 WEIGHT_DECAY = 1e-5
 TEMPERATURE = 0.1  # For contrastive learning
 PROJECTION_DIM = 128
-EPOCHS_PRETRAIN = 20
-EPOCHS_FINETUNE = 20
+EPOCHS_PRETRAIN = 50
+EPOCHS_FINETUNE = 50
 
 # Dataset Class
 class DentalDataset:
@@ -104,6 +107,28 @@ def dice_loss(y_true, y_pred, smooth=1):
 
     dice = (2. * intersection + smooth) / (union + smooth)
     return 1 - dice
+
+# Dice Coefficient Metric
+def dice_coefficient(y_true, y_pred, threshold=0.5, smooth=1):
+    """
+    Dice coefficient metric for segmentation
+    Formula: 2*|X∩Y|/(|X|+|Y|)
+    """
+    # Threshold predictions to get binary masks
+    y_pred = tf.cast(y_pred > threshold, tf.float32)
+    y_true = tf.cast(y_true, tf.float32)
+
+    # Flatten the arrays
+    y_true_f = tf.reshape(y_true, [-1])
+    y_pred_f = tf.reshape(y_pred, [-1])
+
+    # Calculate intersection and union
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    union = tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f)
+
+    # Calculate Dice coefficient
+    dice = (2. * intersection + smooth) / (union + smooth)
+    return dice
 
 # Encoder Network
 def create_encoder(input_shape=IMAGE_SHAPE):
@@ -325,6 +350,7 @@ def nt_xent_loss(z1, z2, temperature=TEMPERATURE):
 
     return loss
 
+
 # Fixed ContrastiveTrainer class with progress bar
 class ContrastiveTrainer:
     def __init__(self, model, temperature=TEMPERATURE, learning_rate=LEARNING_RATE_PRETRAIN):
@@ -398,189 +424,116 @@ class TqdmProgressCallback(tf.keras.callbacks.Callback):
             metrics_str = " - ".join([f"{k}: {v:.4f}" for k, v in logs.items()])
             print(f"Epoch {epoch+1}/{self.epochs}: {metrics_str}")
 
-# Alternative approach for Grad-CAM without requiring model reconstruction
-def make_gradcam_heatmap(img_array, model):
+
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name=None, pred_index=None):
     """
-    Create a Grad-CAM heatmap for segmentation model using a direct approach
+    Create a proper Grad-CAM heatmap for a segmentation model
 
     Args:
         img_array: Input image (should be preprocessed)
         model: Trained segmentation model
+        last_conv_layer_name: Name of the last conv layer, if None will try to find automatically
+        pred_index: Index of output to use for class activation map, if None will use predictions
 
     Returns:
         Heatmap array
     """
-    # Find the last convolutional layer before the output
-    conv_layers = [layer for layer in model.layers if 'conv2d' in layer.name]
-    if not conv_layers:
-        print("No convolutional layers found in model")
-        return np.zeros((img_array.shape[1], img_array.shape[2]))
+    # If last_conv_layer not specified, find it automatically
+    if last_conv_layer_name is None:
+        # Find the last convolutional layer
+        for layer in reversed(model.layers):
+            if 'conv' in layer.name and not 'transpose' in layer.name:
+                last_conv_layer_name = layer.name
+                print(f"Using {last_conv_layer_name} as the last convolutional layer")
+                break
 
-    # Use the second-to-last convolutional layer
-    # This is a common choice for Grad-CAM in segmentation networks
-    target_layer = conv_layers[-2]
+    # First, create a model that maps the input image to the activations
+    # of the last conv layer and the output predictions
+    grad_model = tf.keras.models.Model(
+        inputs=[model.inputs],
+        outputs=[
+            model.get_layer(last_conv_layer_name).output,
+            model.output
+        ]
+    )
 
-    # Create a simplified visualization that doesn't rely on intermediate models
-    # Just use a dummy model to compute basic activation patterns
+    # Then, compute the gradient of the output with respect to the output feature map
+    with tf.GradientTape() as tape:
+        # Cast image to float32
+        img_array = tf.cast(img_array, tf.float32)
 
-    # First, get the prediction for this image
-    predictions = model.predict(img_array, verbose=0)
+        # Compute activations of the last conv layer and predictions
+        last_conv_layer_output, preds = grad_model(img_array)
 
-    # Create a simplified heatmap based on pixel-wise contribution
-    # For a segmentation model, where the positive predictions are is informative
-    pred_mask = (predictions[0, :, :, 0] > 0.5).astype(np.float32)
+        # For segmentation, we want to use the mean of the entire prediction
+        # as our target instead of a specific class index
+        if pred_index is None:
+            if preds.shape[-1] == 1:  # Binary segmentation
+                pred_index = 0
 
-    # Upsample the prediction mask to image size if needed
-    if pred_mask.shape != (img_array.shape[1], img_array.shape[2]):
-        pred_mask = cv2.resize(pred_mask, (img_array.shape[2], img_array.shape[1]))
+        # Take the mean prediction across the entire output (for segmentation)
+        pred = preds[:, :, :, pred_index]
 
-    # Apply smoothing to create a more visually interpretable heatmap
-    heatmap = cv2.GaussianBlur(pred_mask, (15, 15), 0)
+        # This is the gradient of the mean prediction with respect to
+        # the output feature map of the last conv layer
+        grads = tape.gradient(tf.reduce_mean(pred), last_conv_layer_output)
 
-    # Normalize heatmap
-    if np.max(heatmap) > 0:
-        heatmap = heatmap / np.max(heatmap)
+    # Vector of shape (batch_size, features), with one value per channel
+    pooled_grads = tf.reduce_mean(grads, axis=(1, 2))
+
+    # Weight the channels by the gradient importance
+    last_conv_layer_output = last_conv_layer_output.numpy()[0]
+    pooled_grads = pooled_grads.numpy()[0]
+
+    # Apply the weights to the conv layer outputs
+    for i in range(pooled_grads.shape[-1]):
+        last_conv_layer_output[:, :, i] *= pooled_grads[i]
+
+    # Average the channels to get the heatmap
+    heatmap = np.mean(last_conv_layer_output, axis=-1)
+
+    # ReLU to only keep positive contributions
+    heatmap = np.maximum(heatmap, 0) / (np.max(heatmap) + 1e-10)
+
+    heatmap = 1.0 - heatmap
 
     return heatmap
 
-# Function to overlay heatmap on the original image
-def overlay_gradcam(img, heatmap, alpha=0.5):
+def overlay_gradcam(img, heatmap, alpha=0.4, colormap=cv2.COLORMAP_JET):
     """
-    Overlay Grad-CAM heatmap on the original image
+    Overlay Grad-CAM heatmap on the original image with customizable colormap
 
     Args:
         img: Original image (grayscale)
         heatmap: Grad-CAM heatmap
         alpha: Transparency factor
+        colormap: OpenCV colormap to use (default: COLORMAP_JET)
 
     Returns:
         Overlaid image
     """
-    # Expand dimensions if needed (for grayscale images)
-    if len(img.shape) == 2:
-        img = np.expand_dims(img, axis=-1)
+    # Ensure img is normalized to 0-255 range
+    if img.max() <= 1.0:
+        img = (img * 255).astype(np.uint8)
 
     # Resize heatmap to match image size
     heatmap = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
 
-    # Convert heatmap to RGB and apply JET colormap
+    # Apply colormap to heatmap
     heatmap = np.uint8(255 * heatmap)
-    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    colored_heatmap = cv2.applyColorMap(heatmap, colormap)
 
     # Convert grayscale to RGB if needed
-    if img.shape[-1] == 1:
-        img = np.repeat(img, 3, axis=-1)
-    elif np.max(img) <= 1.0:
-        img = np.uint8(img * 255)
+    if len(img.shape) == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    elif img.shape[-1] == 1:
+        img = cv2.cvtColor(np.squeeze(img), cv2.COLOR_GRAY2RGB)
 
     # Superimpose the heatmap on original image
-    superimposed_img = heatmap * alpha + img
-    superimposed_img = np.clip(superimposed_img, 0, 255).astype(np.uint8)
+    overlaid_img = colored_heatmap * alpha + img * (1 - alpha)
+    overlaid_img = np.clip(overlaid_img, 0, 255).astype(np.uint8)
 
-    return superimposed_img
-
-# Main Execution
-def main():
-    # Paths to dataset - update these to match your environment
-    images_path = '/kaggle/input/childrens-dental-panoramic-radiographs-dataset/Dental_dataset/Adult tooth segmentation dataset/Panoramic radiography database/images'
-    masks_path = '/kaggle/input/childrens-dental-panoramic-radiographs-dataset/Dental_dataset/Adult tooth segmentation dataset/Panoramic radiography database/mask'
-
-    # Create and prepare dataset
-    dental_dataset = DentalDataset(images_path, masks_path)
-    (train_images, train_masks), (test_images, test_masks) = dental_dataset.prepare_data()
-
-    # Create tf.data.Dataset for contrastive learning
-    train_ds = tf.data.Dataset.from_tensor_slices(train_images)
-    train_ds = train_ds.shuffle(len(train_images)).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
-
-    # Create encoder
-    encoder = create_encoder()
-
-    # Create contrastive model
-    contrastive_model = create_contrastive_model(encoder)
-
-    # Print model summary
-    print("Contrastive Model Summary:")
-    contrastive_model.summary()
-
-    # Train contrastive model
-    print("\nPretraining contrastive model...")
-    trainer = ContrastiveTrainer(contrastive_model)
-    trainer.train(train_ds, epochs=EPOCHS_PRETRAIN)
-
-    # Create segmentation model
-    print("\nCreating segmentation model...")
-    segmentation_model = create_segmentation_model(encoder)
-
-    # Print model summary
-    print("Segmentation Model Summary:")
-    segmentation_model.summary()
-
-    # Compile segmentation model
-    segmentation_model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE_FINETUNE),
-        loss=dice_loss,
-        metrics=[
-            'accuracy',
-            tf.keras.metrics.Precision(name='precision'),
-            tf.keras.metrics.Recall(name='recall'),
-            iou_metric
-        ]
-    )
-
-    # Create validation split
-    val_split = int(0.2 * len(train_images))
-    val_images = train_images[:val_split]
-    val_masks = train_masks[:val_split]
-    train_images_split = train_images[val_split:]
-    train_masks_split = train_masks[val_split:]
-
-    # Train segmentation model with custom progress bar
-    print("\nTraining segmentation model...")
-    history = segmentation_model.fit(
-        train_images_split, train_masks_split,
-        batch_size=BATCH_SIZE,
-        epochs=EPOCHS_FINETUNE,
-        validation_data=(val_images, val_masks),
-        callbacks=[
-            TqdmProgressCallback(epochs=EPOCHS_FINETUNE),
-            tf.keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True, verbose=1),
-            tf.keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=5, verbose=1),
-            tf.keras.callbacks.ModelCheckpoint(
-                'best_model.keras', save_best_only=True, monitor='val_iou_metric', mode='max', verbose=1
-            )
-        ],
-        verbose=0  # Turn off default progress bar
-    )
-
-    # Evaluate on test set
-    print("\nEvaluating on test set...")
-    test_progress = tqdm(total=1, desc="Evaluating")
-    results = segmentation_model.evaluate(test_images, test_masks, verbose=0)
-    test_progress.update(1)
-    test_progress.close()
-
-    # Print evaluation results
-    metric_names = ['Loss', 'Accuracy', 'Precision', 'Recall', 'IoU']
-    for name, value in zip(metric_names, results):
-        print(f"Test {name}: {value:.4f}")
-
-    # Save model
-    print("\nSaving model...")
-    save_progress = tqdm(total=1, desc="Saving model")
-    segmentation_model.save('dental_segmentation_model.h5')
-    save_progress.update(1)
-    save_progress.close()
-
-    # Visualize results
-    print("\nVisualizing results...")
-    visualize_results(segmentation_model, test_images, test_masks)
-
-    # Plot training history
-    print("\nPlotting training history...")
-    plot_training_history(history)
-
-    print("\nAll tasks completed successfully!")
+    return overlaid_img
 
 def visualize_results(model, images, masks, num_samples=5):
     """Visualize segmentation results with visualization heatmap"""
@@ -638,7 +591,7 @@ def visualize_results(model, images, masks, num_samples=5):
             # Heatmap visualization
             plt.subplot(num_samples, 4, i*4+4)
             plt.imshow(heatmap_image)
-            plt.title('Attention Heatmap')
+            plt.title('Grad-CAM')
             plt.axis('off')
 
         except Exception as e:
@@ -674,23 +627,130 @@ def visualize_results(model, images, masks, num_samples=5):
 
 def plot_training_history(history):
     """Plot training history"""
-    plt.figure(figsize=(15, 5))
+    plt.figure(figsize=(20, 5))
 
-    # Plot available metrics
-    metrics = ['loss', 'accuracy', 'iou_metric']
-    titles = ['Loss', 'Accuracy', 'IoU']
+    # Plot available metrics with Dice coefficient added
+    metrics = ['loss', 'accuracy', 'iou_metric', 'dice_coefficient']
+    titles = ['Loss', 'Accuracy', 'IoU', 'Dice Coefficient']
 
     for i, (metric, title) in enumerate(zip(metrics, titles)):
-        plt.subplot(1, 3, i+1)
-        plt.plot(history.history[metric], label='Train')
-        plt.plot(history.history[f'val_{metric}'], label='Validation')
-        plt.title(title)
-        plt.xlabel('Epoch')
-        plt.legend()
+        if metric in history.history:
+            plt.subplot(1, 4, i+1)
+            plt.plot(history.history[metric], label='Train')
+            val_metric = f'val_{metric}'
+            if val_metric in history.history:
+                plt.plot(history.history[val_metric], label='Validation')
+            plt.title(title)
+            plt.xlabel('Epoch')
+            plt.legend()
 
     plt.tight_layout()
     plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
     plt.show()
+
+# Main Execution
+def main():
+    # Paths to dataset - update these to match your environment
+    images_path = '/kaggle/input/childrens-dental-panoramic-radiographs-dataset/Dental_dataset/Adult tooth segmentation dataset/Panoramic radiography database/images'
+    masks_path = '/kaggle/input/childrens-dental-panoramic-radiographs-dataset/Dental_dataset/Adult tooth segmentation dataset/Panoramic radiography database/mask'
+
+    # Create and prepare dataset
+    dental_dataset = DentalDataset(images_path, masks_path)
+    (train_images, train_masks), (test_images, test_masks) = dental_dataset.prepare_data()
+
+    # Create tf.data.Dataset for contrastive learning
+    train_ds = tf.data.Dataset.from_tensor_slices(train_images)
+    train_ds = train_ds.shuffle(len(train_images)).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+    # Create encoder
+    encoder = create_encoder()
+
+    # Create contrastive model
+    contrastive_model = create_contrastive_model(encoder)
+
+    # Print model summary
+    print("Contrastive Model Summary:")
+    contrastive_model.summary()
+
+    # Train contrastive model
+    print("\nPretraining contrastive model...")
+    trainer = ContrastiveTrainer(contrastive_model)
+    trainer.train(train_ds, epochs=EPOCHS_PRETRAIN)
+
+    # Create segmentation model
+    print("\nCreating segmentation model...")
+    segmentation_model = create_segmentation_model(encoder)
+
+    # Print model summary
+    print("Segmentation Model Summary:")
+    segmentation_model.summary()
+
+    # Compile segmentation model with dice coefficient added as a metric
+    segmentation_model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE_FINETUNE),
+        loss=dice_loss,
+        metrics=[
+            'accuracy',
+            tf.keras.metrics.Precision(name='precision'),
+            tf.keras.metrics.Recall(name='recall'),
+            iou_metric,
+            dice_coefficient  # Added Dice coefficient metric
+        ]
+    )
+
+    # Create validation split
+    val_split = int(0.2 * len(train_images))
+    val_images = train_images[:val_split]
+    val_masks = train_masks[:val_split]
+    train_images_split = train_images[val_split:]
+    train_masks_split = train_masks[val_split:]
+
+    # Train segmentation model with custom progress bar
+    print("\nTraining segmentation model...")
+    history = segmentation_model.fit(
+        train_images_split, train_masks_split,
+        batch_size=BATCH_SIZE,
+        epochs=EPOCHS_FINETUNE,
+        validation_data=(val_images, val_masks),
+        callbacks=[
+            TqdmProgressCallback(epochs=EPOCHS_FINETUNE),
+            tf.keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True, verbose=1),
+            tf.keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=5, verbose=1),
+            tf.keras.callbacks.ModelCheckpoint(
+                'best_model.keras', save_best_only=True, monitor='val_dice_coefficient', mode='max', verbose=1
+            )
+        ],
+        verbose=0  # Turn off default progress bar
+    )
+
+    # Evaluate on test set
+    print("\nEvaluating on test set...")
+    test_progress = tqdm(total=1, desc="Evaluating")
+    results = segmentation_model.evaluate(test_images, test_masks, verbose=0)
+    test_progress.update(1)
+    test_progress.close()
+
+    # Print evaluation results
+    metric_names = ['Loss', 'Accuracy', 'Precision', 'Recall', 'IoU', 'Dice Coefficient']
+    for name, value in zip(metric_names, results):
+        print(f"Test {name}: {value:.4f}")
+
+    # Save model
+    print("\nSaving model...")
+    save_progress = tqdm(total=1, desc="Saving model")
+    segmentation_model.save('dental_segmentation_model.h5')
+    save_progress.update(1)
+    save_progress.close()
+
+    # Visualize results
+    print("\nVisualizing results...")
+    visualize_results(segmentation_model, test_images, test_masks)
+
+    # Plot training history
+    print("\nPlotting training history...")
+    plot_training_history(history)
+
+    print("\nAll tasks completed successfully!")
 
 if __name__ == "__main__":
     # Try to catch any errors and provide helpful messages
