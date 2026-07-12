@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────
+#  Segmentation Fine-tuning Configuration
+# ─────────────────────────────────────────────
+
+data:
+  images_path: null          # override at runtime or set here
+  masks_path: null
+  image_size: 224
+  channels: 1
+  test_ratio: 0.2
+  val_ratio: 0.2             # fraction of train set used for validation
+
+model:
+  encoder_checkpoint: outputs/pretrain/encoder_pretrained.keras
+  freeze_encoder_epochs: 10  # freeze encoder for first N epochs, then unfreeze
+
+training:
+  batch_size: 16
+  epochs: 50
+  learning_rate: 1.0e-4
+  seed: 42
+  early_stopping_patience: 10
+  reduce_lr_patience: 5
+  reduce_lr_factor: 0.5
+
+output:
+  dir: outputs/finetune
+  best_model: outputs/finetune/best_model.keras
+  final_model: outputs/finetune/dental_segmentation_model.keras
+  log_csv: outputs/finetune/finetune_log.csv
+  results_plot: outputs/finetune/segmentation_results.png
+  history_plot: outputs/finetune/training_history.png

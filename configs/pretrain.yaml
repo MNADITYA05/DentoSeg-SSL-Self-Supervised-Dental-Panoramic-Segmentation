@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────
+#  Contrastive Pre-training Configuration
+# ─────────────────────────────────────────────
+
+data:
+  images_path: null          # override at runtime or set here
+  masks_path: null
+  image_size: 224
+  channels: 1                # 1 = grayscale X-ray
+  test_ratio: 0.2
+
+augmentation:
+  horizontal_flip: true
+  rotation_factor: 0.1
+  gaussian_noise_stddev: 0.05
+  contrast_lower: 0.85
+  contrast_upper: 1.15
+
+model:
+  projection_dim: 128
+  encoder_base_filters: 64   # doubles each block: 64→128→256→512→1024
+
+training:
+  batch_size: 16
+  epochs: 50
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-5
+  temperature: 0.1           # NT-Xent temperature
+  seed: 42
+
+output:
+  dir: outputs/pretrain
+  checkpoint: outputs/pretrain/encoder_pretrained.keras
+  log_csv: outputs/pretrain/pretrain_log.csv

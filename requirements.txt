@@ -1,0 +1,26 @@
+# DentoSeg-SSL — Python dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# TensorFlow: GPU builds are selected automatically by pip on CUDA systems.
+# If you need a CPU-only install replace tensorflow with tensorflow-cpu.
+# On Kaggle/Colab, TensorFlow is pre-installed — only the extras below
+# are needed (the notebook install cell handles this automatically).
+
+tensorflow>=2.12.0,<3.0.0
+
+# Data handling
+numpy>=1.23.0
+opencv-python-headless>=4.7.0   # use headless build on servers/containers
+scikit-learn>=1.2.0
+natsort>=8.3.0
+
+# Visualisation
+matplotlib>=3.7.0
+
+# Training utilities
+tqdm>=4.65.0
+
+# Config
+pyyaml>=6.0
