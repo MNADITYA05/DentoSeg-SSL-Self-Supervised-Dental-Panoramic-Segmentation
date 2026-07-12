@@ -38,7 +38,8 @@ data/masks/
 *.bmp
 *.tif
 *.tiff
-!IMAGES/          # keep the project's own sample images
+!IMAGES/
+!IMAGES/**
 
 # ── Logs & CSVs generated during training ─────────────────────────────
 *.csv
