@@ -18,6 +18,7 @@ def create_projection_head(
     encoder_output: tf.Tensor,
     projection_dim: int = 128,
     hidden_dim: int = 512,
+    name: str = "proj",
 ) -> tf.Tensor:
     """
     Attach a projection MLP to the encoder bottleneck tensor.
@@ -36,9 +37,9 @@ def create_projection_head(
     tf.Tensor
         L2-normalised projection vector of shape (B, projection_dim).
     """
-    x = layers.GlobalAveragePooling2D(name="proj_gap")(encoder_output)
-    x = layers.Dense(hidden_dim, name="proj_dense1")(x)
-    x = layers.BatchNormalization(name="proj_bn")(x)
-    x = layers.Activation("relu", name="proj_relu")(x)
-    x = layers.Dense(projection_dim, name="proj_dense2")(x)
+    x = layers.GlobalAveragePooling2D(name=f"{name}_gap")(encoder_output)
+    x = layers.Dense(hidden_dim, name=f"{name}_dense1")(x)
+    x = layers.BatchNormalization(name=f"{name}_bn")(x)
+    x = layers.Activation("relu", name=f"{name}_relu")(x)
+    x = layers.Dense(projection_dim, name=f"{name}_dense2")(x)
     return x

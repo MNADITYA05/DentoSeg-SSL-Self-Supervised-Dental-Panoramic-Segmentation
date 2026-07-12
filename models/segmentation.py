@@ -66,8 +66,8 @@ def create_contrastive_model(
     bottleneck2, *_ = encoder(view2, training=True)
 
     # Separate projection heads (weights are NOT shared between the two heads)
-    z1 = create_projection_head(bottleneck1, projection_dim=projection_dim)
-    z2 = create_projection_head(bottleneck2, projection_dim=projection_dim)
+    z1 = create_projection_head(bottleneck1, projection_dim=projection_dim, name="proj1")
+    z2 = create_projection_head(bottleneck2, projection_dim=projection_dim, name="proj2")
 
     model = tf.keras.Model(inputs=inputs, outputs=[z1, z2], name="contrastive_model")
     return model
