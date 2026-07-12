@@ -52,7 +52,8 @@ def get_default_paths(env: str = None) -> Dict[str, str]:
 
     if env == "kaggle":
         base = (
-            "/kaggle/input/childrens-dental-panoramic-radiographs-dataset"
+            "/kaggle/input/datasets/truthisneverlinear"
+            "/childrens-dental-panoramic-radiographs-dataset"
             "/Dental_dataset/Adult tooth segmentation dataset"
             "/Panoramic radiography database"
         )
